@@ -1,0 +1,181 @@
+#include "motor.hpp"
+
+struct pwm_info motor_1_pwm_info;
+struct pwm_info motor_2_pwm_info;
+volatile uint32 g_motor_control_ticks = 0;
+volatile int16 g_last_encoder_left = 0;
+volatile int16 g_last_encoder_right = 0;
+volatile int32 g_last_left_pwm_cmd = 0;
+volatile int32 g_last_right_pwm_cmd = 0;
+
+int16 encoder_Left;
+int16 encoder_Right;
+
+int16 Speed_Encoder_l;
+float Speed_P_l, Speed_I_l, Speed_D_l;
+int Speed_Erro_l;
+int Speed_Goal_l;
+int Speed_PID_OUT_l;
+int Speed_Lasterro_l;
+int Speed_Preverro_l;
+
+int16 Speed_Encoder_r;
+float Speed_P_r, Speed_I_r, Speed_D_r;
+int Speed_Erro_r;
+int Speed_Goal_r;
+int Speed_PID_OUT_r;
+int Speed_Lasterro_r;
+int Speed_Preverro_r;
+
+int PWM_Max = 2500, PWM_Min = -2500;
+int16 Speed_Begin = 550;
+int16 Speed_Expect = 0;
+
+float Diff_Speed_error;
+int16 Diff_SpeedL_expect, Diff_SpeedR_expect;
+
+float Diff_Kp = 10.242f, Diff_Kd = 10.274f;
+float K = 2.868f;
+float Servo_angle = 0;
+float Dif = 0;
+
+float K1 = 0.6f;
+float y, x;
+
+void Motor_Argument()
+{
+    Speed_Goal_l = 300;
+    Speed_Goal_r = 300;
+
+    Diff_SpeedL_expect = Speed_Goal_l;
+    Diff_SpeedR_expect = Speed_Goal_r;
+
+    Speed_P_l = 1.5f;
+    Speed_I_l = 1.55f;
+    Speed_D_l = 0.0f;
+
+    Speed_P_r = 1.5f;
+    Speed_I_r = 1.55f;
+    Speed_D_r = 0.0f;
+}
+
+void Motor_Control()
+{
+    ++g_motor_control_ticks;
+    encoder_Left = encoder_get_count(ENCODER_2);
+    encoder_Right = -encoder_get_count(ENCODER_1);
+    g_last_encoder_left = encoder_Left;
+    g_last_encoder_right = encoder_Right;
+
+    Motor_Diff_Pid1();
+    Motor_PID_Left();
+    Motor_PID_Right();
+}
+
+void Motor_Init1()
+{
+    pwm_get_dev_info(MOTOR1_PWM, &motor_1_pwm_info);
+    pwm_get_dev_info(MOTOR2_PWM, &motor_2_pwm_info);
+}
+
+void Encoder_Test1()
+{
+    printf("Encoder_Left1:\t %d, Encoder_Right1:\t %d\n", encoder_Left, encoder_Right);
+}
+
+void Motor_PID_Left(void)
+{
+    Speed_Encoder_l = encoder_Left;
+    Speed_Erro_l = Diff_SpeedL_expect - Speed_Encoder_l;
+
+    Speed_PID_OUT_l += (int)(Speed_P_l * (Speed_Erro_l - Speed_Lasterro_l) +
+                             Speed_I_l * Speed_Erro_l +
+                             Speed_D_l * (Speed_Erro_l - 2 * Speed_Lasterro_l + Speed_Preverro_l));
+
+    if (Speed_PID_OUT_l < PWM_Min) Speed_PID_OUT_l = PWM_Min;
+    else if (Speed_PID_OUT_l > PWM_Max) Speed_PID_OUT_l = PWM_Max;
+
+    Speed_Preverro_l = Speed_Lasterro_l;
+    Speed_Lasterro_l = Speed_Erro_l;
+
+    if (Speed_PID_OUT_l >= 0)
+    {
+        gpio_set_level(MOTOR1_DIR, 0);
+        pwm_set_duty(MOTOR1_PWM, Speed_PID_OUT_l);
+        g_last_left_pwm_cmd = Speed_PID_OUT_l;
+    }
+    else
+    {
+        gpio_set_level(MOTOR1_DIR, 1);
+        pwm_set_duty(MOTOR1_PWM, -Speed_PID_OUT_l);
+        g_last_left_pwm_cmd = -Speed_PID_OUT_l;
+    }
+}
+
+void Motor_PID_Right(void)
+{
+    Speed_Encoder_r = encoder_Right;
+    Speed_Erro_r = Diff_SpeedR_expect - Speed_Encoder_r;
+
+    Speed_PID_OUT_r += (int)(Speed_P_r * (Speed_Erro_r - Speed_Lasterro_r) +
+                             Speed_I_r * Speed_Erro_r +
+                             Speed_D_r * (Speed_Erro_r - 2 * Speed_Lasterro_r + Speed_Preverro_r));
+
+    if (Speed_PID_OUT_r < PWM_Min) Speed_PID_OUT_r = PWM_Min;
+    else if (Speed_PID_OUT_r > PWM_Max) Speed_PID_OUT_r = PWM_Max;
+
+    Speed_Preverro_r = Speed_Lasterro_r;
+    Speed_Lasterro_r = Speed_Erro_r;
+
+    if (Speed_PID_OUT_r >= 0)
+    {
+        gpio_set_level(MOTOR2_DIR, 1);
+        pwm_set_duty(MOTOR2_PWM, Speed_PID_OUT_r);
+        g_last_right_pwm_cmd = Speed_PID_OUT_r;
+    }
+    else
+    {
+        gpio_set_level(MOTOR2_DIR, 0);
+        pwm_set_duty(MOTOR2_PWM, -Speed_PID_OUT_r);
+        g_last_right_pwm_cmd = -Speed_PID_OUT_r;
+    }
+}
+
+void Motor_Diff_Pid1()
+{
+    static float last_turn_error = 0;
+
+    float turn_error = ImageStatus.Det_True - 39.0f;
+    if (turn_error > -2.0f && turn_error < 2.0f)
+    {
+        turn_error = 0;
+    }
+
+    float current_Kp = Diff_Kp;
+    if (turn_error > -10.0f && turn_error < 10.0f)
+    {
+        current_Kp = Diff_Kp * 0.6f;
+    }
+    else
+    {
+        current_Kp = Diff_Kp;
+    }
+
+    float turn_output = current_Kp * turn_error + Diff_Kd * (turn_error - last_turn_error);
+    last_turn_error = turn_error;
+
+    float turn_limit = 500.0f;
+    if (turn_output > turn_limit) turn_output = turn_limit;
+    if (turn_output < -turn_limit) turn_output = -turn_limit;
+
+    int current_base_speed = Speed_Goal_l - (int)(abs(turn_error) * 3.5f);
+    if (current_base_speed < 120) current_base_speed = 120;
+
+    Diff_SpeedL_expect = current_base_speed + (int)turn_output;
+    Diff_SpeedR_expect = current_base_speed - (int)turn_output;
+
+    if (Diff_SpeedL_expect < 0) Diff_SpeedL_expect = 0;
+    if (Diff_SpeedR_expect < 0) Diff_SpeedR_expect = 0;
+    if (Diff_SpeedL_expect > 1500) Diff_SpeedL_expect = 1500;
+    if (Diff_SpeedR_expect > 1500) Diff_SpeedR_expect = 1500;
+}

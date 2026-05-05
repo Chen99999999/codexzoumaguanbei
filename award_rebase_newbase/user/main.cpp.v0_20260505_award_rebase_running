@@ -1,0 +1,77 @@
+#include "zf_common_headfile.h"
+
+static void cleanup_all()
+{
+    pwm_set_duty(PWM1, 0);
+    pwm_set_duty(PWM2, 0);
+    pwm_set_duty(PWM3, 0);
+}
+
+static void sigint_handler(int)
+{
+    cleanup_all();
+    exit(0);
+}
+
+static uint8 image_copy[UVC_HEIGHT][UVC_WIDTH];
+
+int main()
+{
+    signal(SIGINT, sigint_handler);
+    atexit(cleanup_all);
+
+    Init_all();
+    Data_Settings();
+
+    while (true)
+    {
+        if (wait_image_refresh() < 0)
+        {
+            exit(0);
+        }
+
+        ImageProcess();
+
+        for (int y = 0; y < 60; ++y)
+        {
+            for (int x = 0; x < 80; ++x)
+            {
+                uint8 color = (Pixle[y][x] == 0) ? 0 : 255;
+                int map_y = y * 2;
+                int map_x = x * 2;
+                image_copy[map_y][map_x] = color;
+                image_copy[map_y][map_x + 1] = color;
+                image_copy[map_y + 1][map_x] = color;
+                image_copy[map_y + 1][map_x + 1] = color;
+            }
+        }
+
+        for (int y = 0; y < 60; ++y)
+        {
+            int left_x = ImageDeal[y].close_LeftBorder * 2;
+            int right_x = ImageDeal[y].close_RightBorder * 2;
+            int mid_x = ImageDeal[y].Center * 2;
+            int map_y = y * 2;
+
+            if (left_x >= 0 && left_x < 160)
+            {
+                image_copy[map_y][left_x] = 128;
+                image_copy[map_y + 1][left_x] = 128;
+            }
+
+            if (right_x >= 0 && right_x < 160)
+            {
+                image_copy[map_y][right_x] = 128;
+                image_copy[map_y + 1][right_x] = 128;
+            }
+
+            if (mid_x >= 0 && mid_x < 160)
+            {
+                image_copy[map_y][mid_x] = 128;
+                image_copy[map_y + 1][mid_x] = 128;
+            }
+        }
+    }
+
+    return 0;
+}
