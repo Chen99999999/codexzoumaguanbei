@@ -1,8 +1,14 @@
-#include "smartcar_motor.hpp"
+﻿#include "smartcar_motor.hpp"
 
 #include <cstdio>
 #include <cstdlib>
 #include <fcntl.h>
+
+#define SMARTCAR_MOTOR_QUIET_PRINTF 1
+#if SMARTCAR_MOTOR_QUIET_PRINTF
+#define printf(...) do {} while (0)
+#endif
+
 
 #define MOTOR1_PWM_PATH     ZF_PWM_MOTOR_1
 #define MOTOR1_DIR_PATH     ZF_GPIO_MOTOR_1
@@ -42,9 +48,14 @@ static int abs_int(int x)
 
 static void print_x100(const char *name, int value_x100)
 {
+#if SMARTCAR_MOTOR_QUIET_PRINTF
+    (void)name;
+    (void)value_x100;
+#else
     int sign = value_x100 < 0 ? -1 : 1;
     int abs_v = abs_int(value_x100);
     printf("%s=%s%d.%02d%%", name, sign < 0 ? "-" : "", abs_v / 100, abs_v % 100);
+#endif
 }
 
 static void set_one_motor_x100(zf_driver_gpio &dir_dev,
@@ -70,7 +81,7 @@ static void set_one_motor_x100(zf_driver_gpio &dir_dev,
     dir_dev.set_level(dir_level);
     pwm_dev.set_duty(duty);
 
-    // printf("[motor] ");
+    // // printf("[motor] ");
     print_x100("pwm", percent_x100);
     printf(" dir=%d duty=%u duty_max=%u\n", dir_level, duty, pwm_info.duty_max);
 }
@@ -125,7 +136,7 @@ void motor_set_pwm_x100(int left_percent_x100, int right_percent_x100)
     set_one_motor_x100(motor2_dir, motor2_pwm, motor2_pwm_info,
                        MOTOR2_FORWARD_LEVEL, right_percent_x100);
 
-    // printf("[motor_set_pwm_x100] ");
+//    // // printf("[motor_set_pwm_x100] ");
     print_x100("L", left_percent_x100);
     printf(" ");
     print_x100("R", right_percent_x100);

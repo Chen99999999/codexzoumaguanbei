@@ -175,15 +175,3 @@ target_include_directories(E03_01_drv8701e_double_motor_control_demo PRIVATE
     ${CMAKE_CURRENT_LIST_DIR}/../../libraries/smartcar_app
 )
 # ===== smartcar_app line wrapper end =====
-
-# ===== award vision bridge begin =====
-target_sources(E03_01_drv8701e_double_motor_control_demo PRIVATE
-    ${CMAKE_CURRENT_LIST_DIR}/../../../../src/image.cpp
-    ${CMAKE_CURRENT_LIST_DIR}/../../../../src/award_signal.cpp
-    ${CMAKE_CURRENT_LIST_DIR}/../../../../src/award_vision_adapter.cpp
-)
-
-target_include_directories(E03_01_drv8701e_double_motor_control_demo PRIVATE
-    ${CMAKE_CURRENT_LIST_DIR}/../../../../include
-)
-# ===== award vision bridge end =====
