@@ -1,0 +1,190 @@
+#include "smartcar_motor.hpp"
+#include "smartcar_display.hpp"
+#include "smartcar_camera.hpp"
+#include "smartcar_line.hpp"
+#include "smartcar_encoder.hpp"
+#include "smartcar_speed.hpp"
+
+#include <stdio.h>
+#include <unistd.h>
+#include <signal.h>
+
+static volatile int g_running = 1;
+
+static void delay_ms(int ms)
+{
+    usleep(ms * 1000);
+}
+
+static int clamp_i(int v, int lo, int hi)
+{
+    if (v < lo) return lo;
+    if (v > hi) return hi;
+    return v;
+}
+
+static void on_signal(int)
+{
+    g_running = 0;
+    speed_control_stop();
+    motor_stop();
+}
+
+static void show_debug(const smartcar_line_result_t &line, int ctrl_err, int lt, int rt)
+{
+    display_show_gray_image(camera_get_gray(), camera_get_width(), camera_get_height());
+
+    display_line(8, "RIGHT EDGE");
+    display_value(9,  "V",   line.valid);
+    display_value(10, "CX",  line.center_x);
+    display_value(11, "CE",  ctrl_err);
+    display_value(12, "LT",  lt);
+    display_value(13, "RT",  rt);
+    display_value(14, "ML",  speed_control_get_left_measured());
+    display_value(15, "MR",  speed_control_get_right_measured());
+}
+
+int main(int, char **)
+{
+    printf("\n========== SMARTCAR RIGHT-EDGE LINE FOLLOW ==========\n");
+    printf("[SAFETY] Ctrl+C stop motor.\n");
+
+    signal(SIGINT, on_signal);
+    signal(SIGTERM, on_signal);
+
+    motor_init();
+    motor_stop();
+
+    encoder_init();
+    encoder_clear();
+
+    display_init();
+    display_clear();
+    display_line(0, "RIGHT EDGE LINE");
+
+    if (!camera_init())
+    {
+        printf("[main] camera_init failed\n");
+        display_line(1, "CAM FAIL");
+
+        while (1)
+        {
+            motor_stop();
+            delay_ms(1000);
+        }
+    }
+
+    printf("[main] camera ok, size=%dx%d\n", camera_get_width(), camera_get_height());
+
+    line_init();
+
+    speed_control_init(100);
+    speed_control_stop();
+
+    // 现在算法实际更像在识别右边线，所以目标点不要放在 80
+    // 160x120 图像里，右边线合理目标先放在 110
+    const int TARGET_X = 120;
+
+    // 速度先保守一点
+    const int BASE_TARGET = 1600;
+
+    // 右转过强，所以右转增益小一点
+    // control_error > 0：需要右转
+    // control_error < 0：需要左转
+    const int LINE_K_RIGHT = 5;
+    const int LINE_K_LEFT = 22;
+
+    const int TURN_LIMIT = 1600;
+    const int TARGET_MAX = 3200;
+    const int TARGET_DEAD = 900;
+
+    int frame_count = 0;
+    int lost_count = 0;
+
+    while (g_running)
+    {
+        if (!camera_update())
+        {
+            printf("[main] camera_update failed\n");
+            speed_control_set_target(0, 0);
+            speed_control_update();
+            motor_stop();
+            delay_ms(100);
+            continue;
+        }
+
+        line_update();
+        smartcar_line_result_t line = line_get_result();
+
+        int left_target = 0;
+        int right_target = 0;
+        int control_error = 0;
+
+        if (line.valid)
+        {
+            lost_count = 0;
+
+            // 核心修改：不再让 CX 对准 80，而是对准 TARGET_X=110
+            control_error = line.center_x - TARGET_X;
+
+            int k = (control_error > 0) ? LINE_K_RIGHT : LINE_K_LEFT;
+            int turn = k * control_error;
+            turn = clamp_i(turn, -TURN_LIMIT, TURN_LIMIT);
+
+            // control_error > 0：识别点太靠右，需要右转：左轮快，右轮慢
+            // control_error < 0：识别点太靠左，需要左转：左轮慢，右轮快
+            left_target  = BASE_TARGET + turn;
+            right_target = BASE_TARGET - turn;
+
+            left_target  = clamp_i(left_target,  0, TARGET_MAX);
+            right_target = clamp_i(right_target, 0, TARGET_MAX);
+
+            // 小目标直接归零，避免 300 这种半死不活速度
+            if (left_target > 0 && left_target < TARGET_DEAD)
+            {
+                left_target = 0;
+            }
+
+            if (right_target > 0 && right_target < TARGET_DEAD)
+            {
+                right_target = 0;
+            }
+        }
+        else
+        {
+            lost_count++;
+            left_target = 0;
+            right_target = 0;
+        }
+
+        speed_control_set_target(left_target, right_target);
+        speed_control_update();
+
+        show_debug(line, control_error, left_target, right_target);
+
+        if ((frame_count % 5) == 0)
+        {
+            printf("[line] V=%d lost=%d CX=%d rawE=%d CE=%d LT=%d RT=%d ML=%d MR=%d LPWM=%d RPWM=%d\n",
+                   line.valid,
+                   lost_count,
+                   line.center_x,
+                   line.error,
+                   control_error,
+                   left_target,
+                   right_target,
+                   speed_control_get_left_measured(),
+                   speed_control_get_right_measured(),
+                   speed_control_get_left_pwm_x100(),
+                   speed_control_get_right_pwm_x100());
+        }
+
+        frame_count++;
+        delay_ms(100);
+    }
+
+    speed_control_stop();
+    motor_stop();
+
+    printf("[main] stopped\n");
+    return 0;
+}

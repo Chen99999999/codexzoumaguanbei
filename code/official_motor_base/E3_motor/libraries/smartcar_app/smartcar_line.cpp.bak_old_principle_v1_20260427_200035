@@ -1,0 +1,255 @@
+#include "smartcar_line.hpp"
+#include "smartcar_camera.hpp"
+
+#include <stdio.h>
+
+// 1 = 找黑线/深色区域
+// 0 = 找白线/浅色区域
+#define SMARTCAR_LINE_DARK 0
+
+#define LINE_MIN_WIDTH       3
+#define LINE_MIN_CONTRAST    15
+
+static smartcar_line_result_t g_line;
+
+static int abs_i(int x)
+{
+    return x < 0 ? -x : x;
+}
+
+static int is_line_pixel(int pix, int threshold)
+{
+#if SMARTCAR_LINE_DARK
+    return pix < threshold;
+#else
+    return pix > threshold;
+#endif
+}
+
+static int analyze_row(
+    const unsigned char *gray,
+    int w,
+    int h,
+    int y,
+    int prefer_center,
+    int *out_l,
+    int *out_r,
+    int *out_c,
+    int *out_thr
+)
+{
+    if (!gray || w <= 0 || h <= 0) return 0;
+    if (y < 0 || y >= h) return 0;
+
+    const unsigned char *row = gray + y * w;
+
+    int minv = 255;
+    int maxv = 0;
+    long sum = 0;
+
+    for (int x = 2; x < w - 2; x++)
+    {
+        int v = row[x];
+        if (v < minv) minv = v;
+        if (v > maxv) maxv = v;
+        sum += v;
+    }
+
+    int contrast = maxv - minv;
+    if (contrast < LINE_MIN_CONTRAST)
+    {
+        return 0;
+    }
+
+    int mean = (int)(sum / (w - 4));
+    int threshold = (minv + maxv) / 2;
+
+#if SMARTCAR_LINE_DARK
+    if (threshold > mean - 3) threshold = mean - 3;
+#else
+    if (threshold < mean + 3) threshold = mean + 3;
+#endif
+
+    int best_l = -1;
+    int best_r = -1;
+    int best_score = -1000000;
+
+    int x = 2;
+    while (x < w - 2)
+    {
+        while (x < w - 2 && !is_line_pixel(row[x], threshold))
+        {
+            x++;
+        }
+
+        int l = x;
+
+        while (x < w - 2 && is_line_pixel(row[x], threshold))
+        {
+            x++;
+        }
+
+        int r = x - 1;
+        int len = r - l + 1;
+
+        if (len >= LINE_MIN_WIDTH && len <= w * 8 / 10)
+        {
+            int c = (l + r) / 2;
+            int score = len * 20 - abs_i(c - prefer_center) * 3;
+
+            if (score > best_score)
+            {
+                best_score = score;
+                best_l = l;
+                best_r = r;
+            }
+        }
+    }
+
+    if (best_l < 0 || best_r < 0) return 0;
+
+    *out_l = best_l;
+    *out_r = best_r;
+    *out_c = (best_l + best_r) / 2;
+    *out_thr = threshold;
+
+    return 1;
+}
+
+void line_init(void)
+{
+    g_line.valid = 0;
+    g_line.center_x = 0;
+    g_line.error = 0;
+    g_line.left_x = 0;
+    g_line.right_x = 0;
+    g_line.row_y = 0;
+    g_line.threshold = 0;
+    g_line.width = 0;
+    g_line.height = 0;
+    g_line.used_rows = 0;
+    g_line.line_width = 0;
+}
+
+int line_update(void)
+{
+    const unsigned char *gray = (const unsigned char *)camera_get_gray();
+    int w = camera_get_width();
+    int h = camera_get_height();
+
+    g_line.width = w;
+    g_line.height = h;
+
+    if (!gray || w <= 0 || h <= 0)
+    {
+        g_line.valid = 0;
+        return 0;
+    }
+
+    int rows[5];
+    rows[0] = h * 85 / 100;
+    rows[1] = h * 75 / 100;
+    rows[2] = h * 65 / 100;
+    rows[3] = h * 55 / 100;
+    rows[4] = h * 45 / 100;
+
+    int weights[5] = {5, 4, 3, 2, 1};
+
+    int prefer_center = g_line.valid ? g_line.center_x : w / 2;
+
+    long center_sum = 0;
+    long weight_sum = 0;
+    int used = 0;
+
+    int best_l = 0;
+    int best_r = 0;
+    int best_c = 0;
+    int best_y = 0;
+    int best_thr = 0;
+    int best_weight = -1;
+
+    for (int i = 0; i < 5; i++)
+    {
+        int l = 0;
+        int r = 0;
+        int c = 0;
+        int thr = 0;
+
+        if (analyze_row(gray, w, h, rows[i], prefer_center, &l, &r, &c, &thr))
+        {
+            int weight = weights[i];
+
+            center_sum += c * weight;
+            weight_sum += weight;
+            used++;
+
+            if (weight > best_weight)
+            {
+                best_weight = weight;
+                best_l = l;
+                best_r = r;
+                best_c = c;
+                best_y = rows[i];
+                best_thr = thr;
+            }
+
+            prefer_center = c;
+        }
+    }
+
+    if (used <= 0 || weight_sum <= 0)
+    {
+        g_line.valid = 0;
+        g_line.used_rows = 0;
+        return 0;
+    }
+
+    g_line.valid = 1;
+    g_line.center_x = (int)(center_sum / weight_sum);
+    g_line.error = g_line.center_x - w / 2;
+
+    g_line.left_x = best_l;
+    g_line.right_x = best_r;
+    g_line.row_y = best_y;
+    g_line.threshold = best_thr;
+    g_line.used_rows = used;
+    g_line.line_width = best_r - best_l + 1;
+
+    return 1;
+}
+
+smartcar_line_result_t line_get_result(void)
+{
+    return g_line;
+}
+
+int line_is_valid(void)
+{
+    return g_line.valid;
+}
+
+int line_get_center_x(void)
+{
+    return g_line.center_x;
+}
+
+int line_get_error(void)
+{
+    return g_line.error;
+}
+
+void line_print(void)
+{
+    printf("[line] valid=%d center=%d error=%d used=%d row=%d L=%d R=%d width=%d thr=%d img=%dx%d\n",
+           g_line.valid,
+           g_line.center_x,
+           g_line.error,
+           g_line.used_rows,
+           g_line.row_y,
+           g_line.left_x,
+           g_line.right_x,
+           g_line.line_width,
+           g_line.threshold,
+           g_line.width,
+           g_line.height);
+}

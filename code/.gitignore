@@ -1,0 +1,33 @@
+# Build outputs
+build/
+out/
+cmake-build-*/
+CMakeFiles/
+CMakeCache.txt
+Makefile
+cmake_install.cmake
+
+# Object / dependency files
+*.o
+*.d
+*.a
+*.so
+*.elf
+
+# Backup files
+*.bak
+*.save
+backup_*/
+backup_motor_*/
+
+# Runtime generated images/logs
+*.pgm
+*.ppm
+*.bmp
+*.jpg
+*.png
+*.log
+
+# Editor
+.vscode/
+.idea/

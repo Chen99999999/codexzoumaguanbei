@@ -1,0 +1,308 @@
+#include "smartcar_motor.hpp"
+#include "smartcar_display.hpp"
+#include "smartcar_camera.hpp"
+#include "smartcar_line.hpp"
+#include "smartcar_encoder.hpp"
+#include "smartcar_speed.hpp"
+
+#include <stdio.h>
+#include <unistd.h>
+#include <signal.h>
+#include <sys/stat.h>
+#include <sys/types.h>
+
+static volatile int g_running = 1;
+
+static void delay_ms(int ms)
+{
+    usleep(ms * 1000);
+}
+
+static int clamp_i(int v, int lo, int hi)
+{
+    if (v < lo) return lo;
+    if (v > hi) return hi;
+    return v;
+}
+
+static void on_signal(int)
+{
+    g_running = 0;
+    speed_control_stop();
+    motor_stop();
+}
+
+static void ensure_debug_dir(void)
+{
+    mkdir("/home/root/line_debug", 0777);
+    mkdir("/home/root/line_debug/pgm", 0777);
+    mkdir("/home/root/line_debug/ppm", 0777);
+}
+
+// 保存原始灰度图，PGM 格式，最适合后续分析
+static void save_pgm(const char *path, const unsigned char *gray, int w, int h)
+{
+    if (!gray || w <= 0 || h <= 0) return;
+
+    FILE *fp = fopen(path, "wb");
+    if (!fp) return;
+
+    fprintf(fp, "P5\n%d %d\n255\n", w, h);
+    fwrite(gray, 1, w * h, fp);
+    fclose(fp);
+}
+
+// 保存带辅助线的彩色图，PPM 格式
+// 红线：图像中心 x=80
+// 绿线：line.center_x
+// 蓝线：TARGET_X
+// 黄横线：line.row_y
+static void save_debug_ppm(
+    const char *path,
+    const unsigned char *gray,
+    int w,
+    int h,
+    const smartcar_line_result_t &line,
+    int target_x
+)
+{
+    if (!gray || w <= 0 || h <= 0) return;
+
+    FILE *fp = fopen(path, "wb");
+    if (!fp) return;
+
+    fprintf(fp, "P6\n%d %d\n255\n", w, h);
+
+    int img_center = w / 2;
+
+    for (int y = 0; y < h; y++)
+    {
+        for (int x = 0; x < w; x++)
+        {
+            unsigned char v = gray[y * w + x];
+
+            unsigned char r = v;
+            unsigned char g = v;
+            unsigned char b = v;
+
+            // 图像中心：红色
+            if (x == img_center)
+            {
+                r = 255; g = 0; b = 0;
+            }
+
+            // 目标控制线：蓝色
+            if (x == target_x)
+            {
+                r = 0; g = 80; b = 255;
+            }
+
+            // 识别中心：绿色，只在范围合法时画
+            if (line.valid && line.center_x >= 0 && line.center_x < w && x == line.center_x)
+            {
+                r = 0; g = 255; b = 0;
+            }
+
+            // 识别行：黄色
+            if (line.valid && line.row_y >= 0 && line.row_y < h && y == line.row_y)
+            {
+                r = 255; g = 255; b = 0;
+            }
+
+            fputc(r, fp);
+            fputc(g, fp);
+            fputc(b, fp);
+        }
+    }
+
+    fclose(fp);
+}
+
+static void show_debug_on_display(const smartcar_line_result_t &line, int control_error, int lt, int rt)
+{
+    display_show_gray_image(camera_get_gray(), camera_get_width(), camera_get_height());
+
+    display_line(8, "CAPTURE");
+    display_value(9,  "V",   line.valid);
+    display_value(10, "CX",  line.center_x);
+    display_value(11, "CE",  control_error);
+    display_value(12, "LT",  lt);
+    display_value(13, "RT",  rt);
+    display_value(14, "ML",  speed_control_get_left_measured());
+    display_value(15, "MR",  speed_control_get_right_measured());
+}
+
+int main(int, char **)
+{
+    printf("\n========== SMARTCAR LINE DEBUG CAPTURE ==========\n");
+    printf("[MODE] motor disabled, capture images and logs only.\n");
+    printf("[CTRL] Ctrl+C stop capture.\n");
+
+    signal(SIGINT, on_signal);
+    signal(SIGTERM, on_signal);
+
+    ensure_debug_dir();
+
+    FILE *csv = fopen("/home/root/line_debug/line_log.csv", "w");
+    if (csv)
+    {
+        fprintf(csv, "frame,valid,width,height,cx,raw_error,target_x,control_error,left_x,right_x,row_y,line_width,threshold,used_rows,lt,rt,ml,mr,lpwm,rpwm\n");
+        fflush(csv);
+    }
+
+    motor_init();
+    motor_stop();
+
+    encoder_init();
+    encoder_clear();
+
+    display_init();
+    display_clear();
+    display_line(0, "CAPTURE DEBUG");
+
+    if (!camera_init())
+    {
+        printf("[main] camera_init failed\n");
+        display_line(1, "CAM FAIL");
+
+        while (1)
+        {
+            motor_stop();
+            delay_ms(1000);
+        }
+    }
+
+    printf("[main] camera ok, size=%dx%d\n", camera_get_width(), camera_get_height());
+
+    line_init();
+
+    speed_control_init(100);
+    speed_control_stop();
+
+    // 这里不是最终控制目标，只是用于记录 CE
+    // 如果你现在跟右边线，先保留 120
+    // 如果你想回到图像中心，就改 80
+    const int TARGET_X = 120;
+
+    int frame = 0;
+
+    while (g_running)
+    {
+        // 采集版禁止电机动
+        speed_control_set_target(0, 0);
+        speed_control_update();
+        motor_stop();
+
+        if (!camera_update())
+        {
+            printf("[capture] camera_update failed\n");
+            display_line(1, "CAM UPDATE FAIL");
+            delay_ms(100);
+            continue;
+        }
+
+        line_update();
+        smartcar_line_result_t line = line_get_result();
+
+        int w = camera_get_width();
+        int h = camera_get_height();
+
+        int control_error = 0;
+        if (line.valid)
+        {
+            control_error = line.center_x - TARGET_X;
+        }
+
+        // 如果 CX 超出图像范围，在日志里强烈标记
+        int cx_bad = 0;
+        if (line.valid && (line.center_x < 0 || line.center_x >= w))
+        {
+            cx_bad = 1;
+        }
+
+        int lt = 0;
+        int rt = 0;
+
+        show_debug_on_display(line, control_error, lt, rt);
+
+        char pgm_path[256];
+        char ppm_path[256];
+
+        snprintf(pgm_path, sizeof(pgm_path), "/home/root/line_debug/pgm/frame_%04d.pgm", frame);
+        snprintf(ppm_path, sizeof(ppm_path), "/home/root/line_debug/ppm/frame_%04d.ppm", frame);
+
+        const unsigned char *gray = (const unsigned char *)camera_get_gray();
+
+        save_pgm(pgm_path, gray, w, h);
+        save_debug_ppm(ppm_path, gray, w, h, line, TARGET_X);
+
+        int ml = speed_control_get_left_measured();
+        int mr = speed_control_get_right_measured();
+        int lp = speed_control_get_left_pwm_x100();
+        int rp = speed_control_get_right_pwm_x100();
+
+        if (csv)
+        {
+            fprintf(csv,
+                    "%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d\n",
+                    frame,
+                    line.valid,
+                    w,
+                    h,
+                    line.center_x,
+                    line.error,
+                    TARGET_X,
+                    control_error,
+                    line.left_x,
+                    line.right_x,
+                    line.row_y,
+                    line.line_width,
+                    line.threshold,
+                    line.used_rows,
+                    lt,
+                    rt,
+                    ml,
+                    mr,
+                    lp,
+                    rp);
+            fflush(csv);
+        }
+
+        if ((frame % 5) == 0)
+        {
+            printf("[capture] frame=%d V=%d W=%d H=%d CX=%d rawE=%d TX=%d CE=%d bad=%d L=%d R=%d ROW=%d LW=%d TH=%d USED=%d\n",
+                   frame,
+                   line.valid,
+                   w,
+                   h,
+                   line.center_x,
+                   line.error,
+                   TARGET_X,
+                   control_error,
+                   cx_bad,
+                   line.left_x,
+                   line.right_x,
+                   line.row_y,
+                   line.line_width,
+                   line.threshold,
+                   line.used_rows);
+        }
+
+        frame++;
+
+        // 10 FPS 左右，10 秒约 100 帧
+        delay_ms(100);
+    }
+
+    if (csv)
+    {
+        fclose(csv);
+    }
+
+    speed_control_stop();
+    motor_stop();
+
+    printf("[capture] stopped, files saved in /home/root/line_debug\n");
+
+    return 0;
+}

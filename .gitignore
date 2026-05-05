@@ -1,0 +1,46 @@
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+
+# Python / temp
+__pycache__/
+*.pyc
+tmp/
+tmp_*/
+debug_from_board/
+clean_port_tmp/
+tmp_video_review/
+tmp_video_review_dense/
+
+# Local backups / extracted docs
+*.bak
+*.orig
+track_manual_extract.txt
+
+# CMake / build outputs
+build/
+out/
+out_*/
+cmake-build-*/
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+Makefile
+compile_commands.json
+
+# Binary outputs / logs / captures
+*.o
+*.obj
+*.exe
+*.log
+*.csv
+*.pgm
+*.ppm
+
+# Board runtime dumps
+line_run/
+capture/
+
+# Huge vendor trees / problematic special files
+code/libraries/seekfree_official/linux-4.19-202506/

@@ -1,0 +1,159 @@
+#include "smartcar_motor.hpp"
+#include "smartcar_display.hpp"
+#include "smartcar_camera.hpp"
+#include "smartcar_line.hpp"
+#include "smartcar_encoder.hpp"
+#include "smartcar_speed.hpp"
+
+#include <stdio.h>
+#include <unistd.h>
+#include <signal.h>
+
+static volatile int g_running = 1;
+
+static void delay_ms(int ms)
+{
+    usleep(ms * 1000);
+}
+
+static int clamp_i(int v, int lo, int hi)
+{
+    if (v < lo) return lo;
+    if (v > hi) return hi;
+    return v;
+}
+
+static void on_signal(int)
+{
+    g_running = 0;
+    speed_control_stop();
+    motor_stop();
+}
+
+static void show_debug_on_display(const smartcar_line_result_t &line, int lt, int rt)
+{
+    display_show_gray_image(camera_get_gray(), camera_get_width(), camera_get_height());
+
+    display_line(8, "AIR LINE");
+    display_value(9,  "V",   line.valid);
+    display_value(10, "CX",  line.center_x);
+    display_value(11, "ERR", line.error);
+    display_value(12, "LT",  lt);
+    display_value(13, "RT",  rt);
+    display_value(14, "ML",  speed_control_get_left_measured());
+    display_value(15, "MR",  speed_control_get_right_measured());
+}
+
+int main(int, char **)
+{
+    printf("\n========== SMARTCAR AIRBORNE LINE FOLLOW ==========\n");
+    printf("[SAFETY] wheels must be off ground.\n");
+    printf("[CTRL] Ctrl+C stops motor.\n");
+
+    signal(SIGINT, on_signal);
+    signal(SIGTERM, on_signal);
+
+    motor_init();
+    motor_stop();
+
+    encoder_init();
+    encoder_clear();
+
+    display_init();
+    display_clear();
+    display_line(0, "AIR LINE DEBUG");
+
+    if (!camera_init())
+    {
+        printf("[main] camera_init failed\n");
+        display_line(1, "CAM FAIL");
+
+        while (1)
+        {
+            motor_stop();
+            delay_ms(1000);
+        }
+    }
+
+    printf("[main] camera ok, size=%dx%d\n", camera_get_width(), camera_get_height());
+
+    line_init();
+
+    speed_control_init(100);
+    speed_control_stop();
+
+    const int BASE_TARGET = 1800;
+    const int LINE_K      = 8;
+    const int TURN_LIMIT  = 700;
+    const int TARGET_MAX  = 2600;
+    const int TARGET_MIN  = 300;
+
+    int frame_count = 0;
+
+    while (g_running)
+    {
+        if (!camera_update())
+        {
+            printf("[main] camera_update failed, stop\n");
+            speed_control_set_target(0, 0);
+            speed_control_update();
+            motor_stop();
+            display_line(1, "CAM UPDATE FAIL");
+            delay_ms(100);
+            continue;
+        }
+
+        line_update();
+        smartcar_line_result_t line = line_get_result();
+
+        int left_target = 0;
+        int right_target = 0;
+
+        if (line.valid)
+        {
+            int turn = LINE_K * line.error;
+            turn = clamp_i(turn, -TURN_LIMIT, TURN_LIMIT);
+
+            // ERR > 0：赛道中心在右边，车应右转：左轮快，右轮慢
+            left_target  = BASE_TARGET + turn;
+            right_target = BASE_TARGET - turn;
+
+            left_target  = clamp_i(left_target,  TARGET_MIN, TARGET_MAX);
+            right_target = clamp_i(right_target, TARGET_MIN, TARGET_MAX);
+        }
+        else
+        {
+            // 看不见线就停车
+            left_target = 0;
+            right_target = 0;
+        }
+
+        speed_control_set_target(left_target, right_target);
+        speed_control_update();
+
+        show_debug_on_display(line, left_target, right_target);
+
+        if ((frame_count % 5) == 0)
+        {
+            printf("[air] V=%d CX=%d ERR=%d LT=%d RT=%d ML=%d MR=%d LPWM=%d RPWM=%d\n",
+                   line.valid,
+                   line.center_x,
+                   line.error,
+                   left_target,
+                   right_target,
+                   speed_control_get_left_measured(),
+                   speed_control_get_right_measured(),
+                   speed_control_get_left_pwm_x100(),
+                   speed_control_get_right_pwm_x100());
+        }
+
+        frame_count++;
+        delay_ms(100);
+    }
+
+    speed_control_stop();
+    motor_stop();
+
+    printf("[main] stopped\n");
+    return 0;
+}

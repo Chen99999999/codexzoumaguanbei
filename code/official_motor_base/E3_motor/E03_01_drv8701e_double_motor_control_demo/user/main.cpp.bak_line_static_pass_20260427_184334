@@ -1,0 +1,103 @@
+#include "smartcar_motor.hpp"
+#include "smartcar_display.hpp"
+#include "smartcar_camera.hpp"
+#include "smartcar_line.hpp"
+
+#include <stdio.h>
+#include <unistd.h>
+
+static void delay_ms(int ms)
+{
+    usleep(ms * 1000);
+}
+
+static void show_line_result_on_display(const smartcar_line_result_t &line)
+{
+    // 先显示原始灰度图
+    display_show_gray_image(camera_get_gray(), camera_get_width(), camera_get_height());
+
+    // 再显示识别结果
+    display_line(8, "LINE STATIC");
+    display_value(9,  "VALID", line.valid);
+    display_value(10, "CX",    line.center_x);
+    display_value(11, "ERR",   line.error);
+    display_value(12, "USED",  line.used_rows);
+    display_value(13, "ROW",   line.row_y);
+    display_value(14, "LW",    line.line_width);
+}
+
+int main(int, char **)
+{
+    printf("\n========== SMARTCAR LINE STATIC DEBUG ==========\n");
+
+    // 1. 电机初始化并强制停止
+    motor_init();
+    motor_stop();
+
+    // 2. 屏幕初始化
+    display_init();
+    display_clear();
+    display_line(0, "LINE STATIC");
+
+    // 3. 摄像头初始化
+    if (!camera_init())
+    {
+        printf("[main] camera_init failed\n");
+        display_line(1, "CAM INIT FAIL");
+
+        while (1)
+        {
+            motor_stop();
+            delay_ms(1000);
+        }
+    }
+
+    printf("[main] camera_init ok, size=%dx%d\n", camera_get_width(), camera_get_height());
+
+    // 4. 线识别初始化
+    line_init();
+
+    int frame_count = 0;
+
+    while (1)
+    {
+        // 安全锁：静态看线阶段，任何时候都不允许电机动
+        motor_stop();
+
+        if (!camera_update())
+        {
+            printf("[main] camera_update failed\n");
+            display_line(1, "CAM UPDATE FAIL");
+            delay_ms(100);
+            continue;
+        }
+
+        line_update();
+
+        smartcar_line_result_t line = line_get_result();
+
+        show_line_result_on_display(line);
+
+        if ((frame_count % 5) == 0)
+        {
+            printf("[static] valid=%d center=%d error=%d used=%d row=%d L=%d R=%d width=%d thr=%d img=%dx%d\n",
+                   line.valid,
+                   line.center_x,
+                   line.error,
+                   line.used_rows,
+                   line.row_y,
+                   line.left_x,
+                   line.right_x,
+                   line.line_width,
+                   line.threshold,
+                   line.width,
+                   line.height);
+        }
+
+        frame_count++;
+
+        delay_ms(100);
+    }
+
+    return 0;
+}

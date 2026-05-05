@@ -1,0 +1,66 @@
+#include "smartcar_motor.hpp"
+#include "smartcar_display.hpp"
+
+#include <stdio.h>
+#include <unistd.h>
+#include <signal.h>
+
+static volatile int g_run = 1;
+
+static void delay_ms(int ms)
+{
+    usleep(ms * 1000);
+}
+
+static void on_signal(int)
+{
+    g_run = 0;
+    motor_stop();
+}
+
+int main(int, char **)
+{
+    signal(SIGINT, on_signal);
+    signal(SIGTERM, on_signal);
+
+    printf("\n========== DIRECT MOTOR TEST ==========\n");
+    printf("[SAFETY] Wheels must be off ground.\n");
+    printf("[CTRL] Ctrl+C stop.\n");
+
+    display_init();
+    display_clear();
+    display_line(0, "MOTOR DIRECT");
+
+    motor_init();
+    motor_stop();
+    delay_ms(1000);
+
+    int pwm_list[] = {500, 800, 1200, 1600};
+    int n = sizeof(pwm_list) / sizeof(pwm_list[0]);
+
+    while (g_run)
+    {
+        for (int i = 0; i < n && g_run; i++)
+        {
+            int pwm = pwm_list[i];
+
+            printf("[test] BOTH + pwm_x100=%d\n", pwm);
+            display_line(1, "BOTH FORWARD");
+            display_value(2, "PWMX100", pwm);
+
+            motor_set_pwm_x100(pwm, pwm);
+
+            for (int t = 0; t < 20 && g_run; t++)
+            {
+                delay_ms(100);
+            }
+
+            motor_stop();
+            delay_ms(1000);
+        }
+    }
+
+    motor_stop();
+    printf("[test] stopped\n");
+    return 0;
+}

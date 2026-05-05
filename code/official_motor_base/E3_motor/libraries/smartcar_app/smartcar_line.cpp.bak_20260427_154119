@@ -1,0 +1,468 @@
+#include "smartcar_line.hpp"
+
+#include <cstdio>
+
+// ===================== 输出状态 =====================
+static int g_valid = 0;
+static int g_center_x = 0;
+static int g_error = 0;
+static int g_threshold = 0;
+static int g_used_rows = 0;
+
+static int g_left_x = 0;
+static int g_right_x = 0;
+static int g_track_width = 0;
+
+static int g_left_lost_rows = 0;
+static int g_right_lost_rows = 0;
+static int g_both_lost_rows = 0;
+
+// ===================== 参数 =====================
+// ROI 下半部分。摄像头 160x120 时，大约从 y=54 扫到 y=115。
+static const int ROI_TOP_PERCENT = 45;
+static const int ROI_BOTTOM_MARGIN = 4;
+
+// 每隔几行扫一次。越小越细，越大越快。
+static const int SCAN_STEP = 2;
+
+// 两侧边缘忽略，避免画面边框和杂物影响。
+static const int X_MARGIN_DIV = 16;
+
+// 暗色段最短长度，太短当噪声。
+static const int MIN_SEG_LEN = 3;
+
+// 有效行最少数量。
+static const int MIN_VALID_ROWS = 3;
+
+static int clamp_int(int x, int low, int high)
+{
+    if (x < low) return low;
+    if (x > high) return high;
+    return x;
+}
+
+static int abs_int(int x)
+{
+    return x >= 0 ? x : -x;
+}
+
+// ROI Otsu 阈值：适合黑线/暗色赛道在亮背景上的情况
+static int compute_otsu_threshold(const uint8 *gray, int width, int height)
+{
+    int hist[256] = {0};
+
+    int x_start = width / X_MARGIN_DIV;
+    int x_end = width - width / X_MARGIN_DIV;
+    int y_start = height * ROI_TOP_PERCENT / 100;
+    int y_end = height - ROI_BOTTOM_MARGIN;
+
+    x_start = clamp_int(x_start, 0, width - 1);
+    x_end = clamp_int(x_end, x_start + 1, width);
+    y_start = clamp_int(y_start, 0, height - 1);
+    y_end = clamp_int(y_end, y_start + 1, height);
+
+    int total = 0;
+
+    for (int y = y_start; y < y_end; y++)
+    {
+        const uint8 *row = gray + y * width;
+        for (int x = x_start; x < x_end; x++)
+        {
+            hist[row[x]]++;
+            total++;
+        }
+    }
+
+    if (total <= 0)
+    {
+        return 128;
+    }
+
+    long sum_total = 0;
+    for (int i = 0; i < 256; i++)
+    {
+        sum_total += (long)i * hist[i];
+    }
+
+    long sum_b = 0;
+    int weight_b = 0;
+    int weight_f = 0;
+
+    double max_var = -1.0;
+    int best_t = 128;
+
+    for (int t = 0; t < 256; t++)
+    {
+        weight_b += hist[t];
+        if (weight_b == 0)
+        {
+            continue;
+        }
+
+        weight_f = total - weight_b;
+        if (weight_f == 0)
+        {
+            break;
+        }
+
+        sum_b += (long)t * hist[t];
+
+        double mean_b = (double)sum_b / weight_b;
+        double mean_f = (double)(sum_total - sum_b) / weight_f;
+        double diff = mean_b - mean_f;
+        double var_between = (double)weight_b * (double)weight_f * diff * diff;
+
+        if (var_between > max_var)
+        {
+            max_var = var_between;
+            best_t = t;
+        }
+    }
+
+    // 防止极端光照下阈值飘得太离谱
+    best_t = clamp_int(best_t, 25, 220);
+    return best_t;
+}
+
+// 找一行中“靠近 prefer_x 的暗色段”
+// 暗色定义：pixel < threshold
+static bool find_dark_segment_near_x(const uint8 *row,
+                                     int width,
+                                     int threshold,
+                                     int prefer_x,
+                                     int *left,
+                                     int *right)
+{
+    int x_start = width / X_MARGIN_DIV;
+    int x_end = width - width / X_MARGIN_DIV - 1;
+
+    x_start = clamp_int(x_start, 0, width - 1);
+    x_end = clamp_int(x_end, x_start, width - 1);
+    prefer_x = clamp_int(prefer_x, x_start, x_end);
+
+    int seed_x = -1;
+
+    // 先从 prefer_x 往两边找最近暗点
+    int max_search = width / 2;
+    for (int d = 0; d <= max_search; d++)
+    {
+        int xl = prefer_x - d;
+        int xr = prefer_x + d;
+
+        if (xl >= x_start && row[xl] < threshold)
+        {
+            seed_x = xl;
+            break;
+        }
+
+        if (xr <= x_end && row[xr] < threshold)
+        {
+            seed_x = xr;
+            break;
+        }
+    }
+
+    if (seed_x < 0)
+    {
+        return false;
+    }
+
+    int l = seed_x;
+    int r = seed_x;
+
+    while (l > x_start && row[l - 1] < threshold)
+    {
+        l--;
+    }
+
+    while (r < x_end && row[r + 1] < threshold)
+    {
+        r++;
+    }
+
+    int len = r - l + 1;
+
+    // 如果靠近 prefer_x 的暗段太短，fallback：找整行最长暗段
+    if (len < MIN_SEG_LEN)
+    {
+        int best_l = -1;
+        int best_r = -1;
+        int best_len = 0;
+
+        int cur_l = -1;
+        int cur_len = 0;
+
+        for (int x = x_start; x <= x_end; x++)
+        {
+            if (row[x] < threshold)
+            {
+                if (cur_l < 0)
+                {
+                    cur_l = x;
+                    cur_len = 1;
+                }
+                else
+                {
+                    cur_len++;
+                }
+            }
+            else
+            {
+                if (cur_len > best_len)
+                {
+                    best_len = cur_len;
+                    best_l = cur_l;
+                    best_r = x - 1;
+                }
+
+                cur_l = -1;
+                cur_len = 0;
+            }
+        }
+
+        if (cur_len > best_len)
+        {
+            best_len = cur_len;
+            best_l = cur_l;
+            best_r = x_end;
+        }
+
+        if (best_l < 0 || best_len < MIN_SEG_LEN)
+        {
+            return false;
+        }
+
+        l = best_l;
+        r = best_r;
+        len = best_len;
+    }
+
+    *left = l;
+    *right = r;
+    return true;
+}
+
+bool line_process(const uint8 *gray, int width, int height)
+{
+    g_valid = 0;
+    g_center_x = width / 2;
+    g_error = 0;
+    g_threshold = 0;
+    g_used_rows = 0;
+
+    g_left_x = 0;
+    g_right_x = width - 1;
+    g_track_width = 0;
+
+    g_left_lost_rows = 0;
+    g_right_lost_rows = 0;
+    g_both_lost_rows = 0;
+
+    if (gray == nullptr || width <= 0 || height <= 0)
+    {
+        return false;
+    }
+
+    int threshold = compute_otsu_threshold(gray, width, height);
+    g_threshold = threshold;
+
+    int x_start = width / X_MARGIN_DIV;
+    int x_end = width - width / X_MARGIN_DIV - 1;
+
+    int y_start = height * ROI_TOP_PERCENT / 100;
+    int y_end = height - ROI_BOTTOM_MARGIN;
+
+    x_start = clamp_int(x_start, 0, width - 1);
+    x_end = clamp_int(x_end, x_start, width - 1);
+    y_start = clamp_int(y_start, 0, height - 1);
+    y_end = clamp_int(y_end, y_start, height - 1);
+
+    // 预计赛道/线宽，用于丢边补线
+    int expected_width = width / 3;
+    expected_width = clamp_int(expected_width, 8, width - 2 * x_start);
+
+    int prev_center = width / 2;
+
+    long weighted_center_sum = 0;
+    long weight_sum = 0;
+
+    int last_left = x_start;
+    int last_right = x_end;
+
+    for (int y = y_end; y >= y_start; y -= SCAN_STEP)
+    {
+        const uint8 *row = gray + y * width;
+
+        int left = 0;
+        int right = 0;
+
+        bool found = find_dark_segment_near_x(row, width, threshold, prev_center, &left, &right);
+
+        if (!found)
+        {
+            g_both_lost_rows++;
+            continue;
+        }
+
+        int raw_left = left;
+        int raw_right = right;
+        int raw_width = raw_right - raw_left + 1;
+
+        int left_lost = 0;
+        int right_lost = 0;
+
+        // 如果暗段贴到图像左侧，认为左边界可能丢失，用右边界补
+        if (raw_left <= x_start + 1)
+        {
+            left_lost = 1;
+            left = right - expected_width + 1;
+            left = clamp_int(left, x_start, x_end);
+        }
+
+        // 如果暗段贴到图像右侧，认为右边界可能丢失，用左边界补
+        if (raw_right >= x_end - 1)
+        {
+            right_lost = 1;
+            right = left + expected_width - 1;
+            right = clamp_int(right, x_start, x_end);
+        }
+
+        if (left_lost && right_lost)
+        {
+            g_both_lost_rows++;
+            continue;
+        }
+
+        if (left_lost)
+        {
+            g_left_lost_rows++;
+        }
+
+        if (right_lost)
+        {
+            g_right_lost_rows++;
+        }
+
+        int center = (left + right) / 2;
+        int fixed_width = right - left + 1;
+
+        if (!left_lost && !right_lost && raw_width >= MIN_SEG_LEN)
+        {
+            // 用完整双边行慢慢更新预计宽度
+            expected_width = (expected_width * 3 + raw_width) / 4;
+            expected_width = clamp_int(expected_width, 6, width - 2 * x_start);
+        }
+
+        // 从底部往上扫，底部权重大
+        int near_weight = y_end - y + 1;
+        int width_weight = fixed_width;
+        int quality_weight = (!left_lost && !right_lost) ? 3 : 1;
+        int weight = near_weight * width_weight * quality_weight;
+
+        if (weight <= 0)
+        {
+            continue;
+        }
+
+        weighted_center_sum += (long)center * weight;
+        weight_sum += weight;
+
+        prev_center = center;
+        last_left = left;
+        last_right = right;
+        g_used_rows++;
+    }
+
+    if (g_used_rows < MIN_VALID_ROWS || weight_sum <= 0)
+    {
+        g_valid = 0;
+        g_center_x = width / 2;
+        g_error = 0;
+        g_left_x = last_left;
+        g_right_x = last_right;
+        g_track_width = expected_width;
+        return false;
+    }
+
+    g_center_x = (int)(weighted_center_sum / weight_sum);
+    g_center_x = clamp_int(g_center_x, 0, width - 1);
+
+    g_error = g_center_x - width / 2;
+    g_left_x = last_left;
+    g_right_x = last_right;
+    g_track_width = expected_width;
+    g_valid = 1;
+
+    return true;
+}
+
+int line_get_valid(void)
+{
+    return g_valid;
+}
+
+int line_get_center_x(void)
+{
+    return g_center_x;
+}
+
+int line_get_error(void)
+{
+    return g_error;
+}
+
+int line_get_threshold(void)
+{
+    return g_threshold;
+}
+
+int line_get_used_rows(void)
+{
+    return g_used_rows;
+}
+
+int line_get_left_x(void)
+{
+    return g_left_x;
+}
+
+int line_get_right_x(void)
+{
+    return g_right_x;
+}
+
+int line_get_track_width(void)
+{
+    return g_track_width;
+}
+
+int line_get_left_lost_rows(void)
+{
+    return g_left_lost_rows;
+}
+
+int line_get_right_lost_rows(void)
+{
+    return g_right_lost_rows;
+}
+
+int line_get_both_lost_rows(void)
+{
+    return g_both_lost_rows;
+}
+
+void line_print(void)
+{
+    printf("[line] valid=%d center=%d error=%d threshold=%d rows=%d L=%d R=%d W=%d lostL=%d lostR=%d lostB=%d\n",
+           g_valid,
+           g_center_x,
+           g_error,
+           g_threshold,
+           g_used_rows,
+           g_left_x,
+           g_right_x,
+           g_track_width,
+           g_left_lost_rows,
+           g_right_lost_rows,
+           g_both_lost_rows);
+}

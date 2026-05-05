@@ -1,0 +1,124 @@
+#include "smartcar_motor.hpp"
+#include "smartcar_display.hpp"
+#include "smartcar_encoder.hpp"
+#include "smartcar_speed.hpp"
+
+#include <stdio.h>
+#include <unistd.h>
+#include <signal.h>
+
+static volatile int g_run = 1;
+
+static void delay_ms(int ms)
+{
+    usleep(ms * 1000);
+}
+
+static void on_signal(int)
+{
+    g_run = 0;
+    speed_control_stop();
+    motor_stop();
+}
+
+static void show_speed(int lt, int rt)
+{
+    display_line(0, "SPEED TEST");
+    display_value(1, "LT", lt);
+    display_value(2, "RT", rt);
+    display_value(3, "ML", speed_control_get_left_measured());
+    display_value(4, "MR", speed_control_get_right_measured());
+    display_value(5, "LP", speed_control_get_left_pwm_x100());
+    display_value(6, "RP", speed_control_get_right_pwm_x100());
+}
+
+int main(int, char **)
+{
+    signal(SIGINT, on_signal);
+    signal(SIGTERM, on_signal);
+
+    printf("\n========== SPEED CONTROL TEST ==========\n");
+    printf("[SAFETY] wheels must be off ground.\n");
+    printf("[CTRL] Ctrl+C stop.\n");
+
+    display_init();
+    display_clear();
+
+    motor_init();
+    motor_stop();
+
+    encoder_init();
+    encoder_clear();
+
+    speed_control_init(100);
+    speed_control_stop();
+
+    delay_ms(1000);
+
+    int phase = 0;
+    int tick = 0;
+
+    while (g_run)
+    {
+        int lt = 0;
+        int rt = 0;
+
+        // 每 5 秒切换一个动作
+        phase = 0;
+
+        if (phase == 0)
+        {
+            // 双轮前进
+            lt = 2200;
+            rt = 2200;
+            display_line(7, "BOTH 1500");
+        }
+        else if (phase == 1)
+        {
+            // 左快右慢，模拟右转
+            lt = 1800;
+            rt = 900;
+            display_line(7, "LEFT FAST");
+        }
+        else if (phase == 2)
+        {
+            // 左慢右快，模拟左转
+            lt = 900;
+            rt = 1800;
+            display_line(7, "RIGHT FAST");
+        }
+        else
+        {
+            // 停车
+            lt = 0;
+            rt = 0;
+            display_line(7, "STOP");
+        }
+
+        speed_control_set_target(lt, rt);
+        speed_control_update();
+
+        show_speed(lt, rt);
+
+        if ((tick % 5) == 0)
+        {
+            printf("[speed] phase=%d LT=%d RT=%d ML=%d MR=%d LPWM=%d RPWM=%d\n",
+                   phase,
+                   lt,
+                   rt,
+                   speed_control_get_left_measured(),
+                   speed_control_get_right_measured(),
+                   speed_control_get_left_pwm_x100(),
+                   speed_control_get_right_pwm_x100());
+        }
+
+        tick++;
+        delay_ms(100);
+    }
+
+    speed_control_stop();
+    motor_stop();
+
+    printf("[speed] stopped\n");
+    return 0;
+}

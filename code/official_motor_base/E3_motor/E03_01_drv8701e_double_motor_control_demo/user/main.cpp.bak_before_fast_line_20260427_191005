@@ -1,0 +1,111 @@
+#include "smartcar_motor.hpp"
+#include "smartcar_display.hpp"
+#include "smartcar_encoder.hpp"
+#include "smartcar_speed.hpp"
+
+#include <stdio.h>
+#include <unistd.h>
+#include <signal.h>
+
+static volatile int g_run = 1;
+
+static void delay_ms(int ms)
+{
+    usleep(ms * 1000);
+}
+
+static void on_signal(int)
+{
+    g_run = 0;
+    speed_control_stop();
+    motor_stop();
+}
+
+int main(int, char **)
+{
+    signal(SIGINT, on_signal);
+    signal(SIGTERM, on_signal);
+
+    printf("\n========== DIFF SPEED TEST ==========\n");
+    printf("[SAFETY] wheels must be off ground.\n");
+
+    display_init();
+    display_clear();
+
+    motor_init();
+    motor_stop();
+
+    encoder_init();
+    encoder_clear();
+
+    speed_control_init(100);
+    speed_control_stop();
+
+    int tick = 0;
+
+    while (g_run)
+    {
+        int phase = (tick / 50) % 4;
+        int lt = 0;
+        int rt = 0;
+
+        if (phase == 0)
+        {
+            // 直行
+            lt = 1800;
+            rt = 1800;
+            display_line(0, "BOTH");
+        }
+        else if (phase == 1)
+        {
+            // 强右转：左轮快，右轮慢
+            lt = 2300;
+            rt = 300;
+            display_line(0, "RIGHT TURN");
+        }
+        else if (phase == 2)
+        {
+            // 强左转：左轮慢，右轮快
+            lt = 300;
+            rt = 2300;
+            display_line(0, "LEFT TURN");
+        }
+        else
+        {
+            lt = 0;
+            rt = 0;
+            display_line(0, "STOP");
+        }
+
+        speed_control_set_target(lt, rt);
+        speed_control_update();
+
+        display_value(1, "PH", phase);
+        display_value(2, "LT", lt);
+        display_value(3, "RT", rt);
+        display_value(4, "ML", speed_control_get_left_measured());
+        display_value(5, "MR", speed_control_get_right_measured());
+        display_value(6, "LP", speed_control_get_left_pwm_x100());
+        display_value(7, "RP", speed_control_get_right_pwm_x100());
+
+        if ((tick % 5) == 0)
+        {
+            printf("[diff] PH=%d LT=%d RT=%d ML=%d MR=%d LPWM=%d RPWM=%d\n",
+                   phase,
+                   lt,
+                   rt,
+                   speed_control_get_left_measured(),
+                   speed_control_get_right_measured(),
+                   speed_control_get_left_pwm_x100(),
+                   speed_control_get_right_pwm_x100());
+        }
+
+        tick++;
+        delay_ms(100);
+    }
+
+    speed_control_stop();
+    motor_stop();
+
+    return 0;
+}

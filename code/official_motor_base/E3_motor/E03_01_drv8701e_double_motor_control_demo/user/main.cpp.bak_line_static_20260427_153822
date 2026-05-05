@@ -1,0 +1,318 @@
+#include "zf_common_headfile.hpp"
+
+#include "smartcar_motor.hpp"
+#include "smartcar_display.hpp"
+#include "smartcar_encoder.hpp"
+#include "smartcar_camera.hpp"
+#include "smartcar_speed.hpp"
+#include "smartcar_line.hpp"
+
+#include <cstdio>
+#include <cstdlib>
+#include <csignal>
+
+#define MODE_CAMERA_CAPTURE     1
+#define MODE_LINE_DEBUG         2
+#define MODE_LINE_FOLLOW        3
+
+// 默认：只看线和 error，不控车
+#ifndef RUN_MODE
+#define RUN_MODE MODE_LINE_DEBUG
+#endif
+
+// 二次保险：即使选择 MODE_LINE_FOLLOW，默认也不允许电机循迹
+#define ENABLE_MOTOR_FOLLOW     0
+
+#define SAMPLE_MS               100
+#define CAPTURE_SAVE_INTERVAL   10
+#define CAPTURE_MAX_COUNT       60
+
+#define FOLLOW_BASE_TARGET      1200
+#define FOLLOW_TURN_KP          8
+#define FOLLOW_TARGET_LIMIT     2200
+#define FOLLOW_LOST_MAX         5
+
+static int clamp_int(int x, int low, int high)
+{
+    if (x < low) return low;
+    if (x > high) return high;
+    return x;
+}
+
+static int abs_int(int x)
+{
+    return x >= 0 ? x : -x;
+}
+
+void cleanup()
+{
+    printf("[cleanup] stop all motors\n");
+    speed_control_stop();
+    motor_stop();
+}
+
+void signal_handler(int signum)
+{
+    printf("[signal] %d, stop all motors and exit\n", signum);
+    cleanup();
+    exit(0);
+}
+
+static void init_common(void)
+{
+    atexit(cleanup);
+    signal(SIGINT, signal_handler);
+    signal(SIGTERM, signal_handler);
+
+    display_init();
+    display_clear();
+    display_title("SMARTCAR MODE");
+
+    motor_init();
+    motor_stop();
+
+    encoder_init();
+    encoder_clear();
+}
+
+static void draw_line_debug_to_screen(const char *mode_name)
+{
+    char buf[64];
+
+    display_show_gray_image(camera_get_gray(), camera_get_width(), camera_get_height());
+
+    snprintf(buf, sizeof(buf), "%s", mode_name);
+    display_line(6, buf);
+
+    snprintf(buf, sizeof(buf), "V=%d C=%d E=%d",
+             line_get_valid(),
+             line_get_center_x(),
+             line_get_error());
+    display_line(7, buf);
+
+    snprintf(buf, sizeof(buf), "TH=%d ROW=%d",
+             line_get_threshold(),
+             line_get_used_rows());
+    display_line(8, buf);
+
+    snprintf(buf, sizeof(buf), "L=%d R=%d W=%d",
+             line_get_left_x(),
+             line_get_right_x(),
+             line_get_track_width());
+    display_line(9, buf);
+
+    snprintf(buf, sizeof(buf), "LL=%d RL=%d BL=%d",
+             line_get_left_lost_rows(),
+             line_get_right_lost_rows(),
+             line_get_both_lost_rows());
+    display_line(10, buf);
+}
+
+static void run_camera_capture(void)
+{
+    printf("========== MODE_CAMERA_CAPTURE ==========\n");
+
+    init_common();
+
+    if (!camera_init())
+    {
+        display_status("CAM INIT FAIL");
+        printf("[capture] camera init failed\n");
+        while (1) system_delay_ms(1000);
+    }
+
+    system("mkdir -p /home/root/capture");
+
+    display_clear();
+    display_title("CAPTURE MODE");
+    display_status("RUNNING");
+
+    int frame_count = 0;
+    int save_count = 0;
+
+    while (1)
+    {
+        if (!camera_update())
+        {
+            display_status("FRAME FAIL");
+            printf("[capture] frame failed\n");
+            system_delay_ms(200);
+            continue;
+        }
+
+        frame_count++;
+
+        display_show_gray_image(camera_get_gray(), camera_get_width(), camera_get_height());
+
+        if (frame_count % CAPTURE_SAVE_INTERVAL == 0 && save_count < CAPTURE_MAX_COUNT)
+        {
+            char path[128];
+            snprintf(path, sizeof(path), "/home/root/capture/gray_%04d.pgm", save_count + 1);
+
+            if (camera_save_gray_pgm(path))
+            {
+                save_count++;
+            }
+
+            char buf[64];
+            snprintf(buf, sizeof(buf), "SAVE %d/%d", save_count, CAPTURE_MAX_COUNT);
+            display_line(7, buf);
+        }
+
+        if (frame_count % 30 == 0)
+        {
+            printf("[capture] frame=%d saved=%d\n", frame_count, save_count);
+            camera_print_status();
+        }
+    }
+}
+
+static void run_line_debug(void)
+{
+    printf("========== MODE_LINE_DEBUG ==========\n");
+    printf("只算 center/error，不控车。\n");
+
+    init_common();
+
+    if (!camera_init())
+    {
+        display_status("CAM INIT FAIL");
+        printf("[line_debug] camera init failed\n");
+        while (1) system_delay_ms(1000);
+    }
+
+    display_clear();
+    display_title("LINE DEBUG");
+    display_status("NO MOTOR");
+
+    int frame_count = 0;
+
+    while (1)
+    {
+        if (!camera_update())
+        {
+            display_status("FRAME FAIL");
+            printf("[line_debug] camera frame failed\n");
+            system_delay_ms(200);
+            continue;
+        }
+
+        frame_count++;
+
+        line_process(camera_get_gray(), camera_get_width(), camera_get_height());
+
+        draw_line_debug_to_screen("LINE DEBUG");
+
+        if (frame_count % 10 == 0)
+        {
+            printf("[line_debug] frame=%d ", frame_count);
+            line_print();
+        }
+    }
+}
+
+static void run_line_follow(void)
+{
+    printf("========== MODE_LINE_FOLLOW ==========\n");
+    printf("ENABLE_MOTOR_FOLLOW=%d\n", ENABLE_MOTOR_FOLLOW);
+
+    init_common();
+
+    if (!camera_init())
+    {
+        display_status("CAM INIT FAIL");
+        printf("[line_follow] camera init failed\n");
+        while (1) system_delay_ms(1000);
+    }
+
+    speed_control_init(SAMPLE_MS);
+    speed_control_stop();
+
+    int lost_count = 0;
+    int frame_count = 0;
+
+    while (1)
+    {
+        if (!camera_update())
+        {
+            lost_count++;
+            speed_control_stop();
+            display_status("FRAME LOST");
+            printf("[line_follow] camera frame lost\n");
+            system_delay_ms(SAMPLE_MS);
+            continue;
+        }
+
+        frame_count++;
+
+        bool ok = line_process(camera_get_gray(), camera_get_width(), camera_get_height());
+
+        draw_line_debug_to_screen("LINE FOLLOW");
+
+        if (!ok || !line_get_valid() || abs_int(line_get_error()) > 75)
+        {
+            lost_count++;
+        }
+        else
+        {
+            lost_count = 0;
+        }
+
+        if (lost_count >= FOLLOW_LOST_MAX)
+        {
+            speed_control_stop();
+            printf("[line_follow] line lost, stop motor\n");
+            system_delay_ms(SAMPLE_MS);
+            continue;
+        }
+
+        int error = line_get_error();
+        int turn = error * FOLLOW_TURN_KP;
+
+        int left_target = FOLLOW_BASE_TARGET - turn;
+        int right_target = FOLLOW_BASE_TARGET + turn;
+
+        left_target = clamp_int(left_target, -FOLLOW_TARGET_LIMIT, FOLLOW_TARGET_LIMIT);
+        right_target = clamp_int(right_target, -FOLLOW_TARGET_LIMIT, FOLLOW_TARGET_LIMIT);
+
+#if ENABLE_MOTOR_FOLLOW
+        speed_control_set_target(left_target, right_target);
+        speed_control_update();
+#else
+        // 默认安全：不控车，只打印将要给的目标速度
+        speed_control_stop();
+#endif
+
+        if (frame_count % 10 == 0)
+        {
+            printf("[line_follow] frame=%d valid=%d error=%d target L=%d R=%d motor=%d\n",
+                   frame_count,
+                   line_get_valid(),
+                   error,
+                   left_target,
+                   right_target,
+                   ENABLE_MOTOR_FOLLOW);
+        }
+
+        system_delay_ms(SAMPLE_MS);
+    }
+}
+
+int main(int, char **)
+{
+    printf("========== SMARTCAR RUN MODE ==========\n");
+    printf("RUN_MODE=%d\n", RUN_MODE);
+
+#if RUN_MODE == MODE_CAMERA_CAPTURE
+    run_camera_capture();
+#elif RUN_MODE == MODE_LINE_DEBUG
+    run_line_debug();
+#elif RUN_MODE == MODE_LINE_FOLLOW
+    run_line_follow();
+#else
+    printf("Unknown RUN_MODE=%d\n", RUN_MODE);
+    while (1) system_delay_ms(1000);
+#endif
+
+    return 0;
+}
